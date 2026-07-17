@@ -80,26 +80,149 @@ export default function ForexTab() {
   const [goldErr, setGoldErr] = useState("");
 
   useEffect(() => {
-    const loadGold = async () => {
-      try {
-        const r = await fetch("/api/thaigold");
-        const d = await r.json();
-        if (d.error) throw new Error(d.error);
-        setThaiGold(d); setGoldErr("");
-      } catch (e) { setGoldErr("ดึงราคาสมาคมค้าทองคำไม่สำเร็จ: " + (e.message || e)); }
-      try {
-        // ดึง Spot ทอง + USD/THB แยกต่างหาก (ทำงานแม้ผู้ใช้ลบ 2 ตัวนี้ออกจากรายการติดตาม)
-        const r2 = await fetch("/api/fx?symbols=" + encodeURIComponent("GC=F,THB=X"));
-        const q = await r2.json();
-        const usd = q["GC=F"] && q["GC=F"].price;
-        const thb = q["THB=X"] && q["THB=X"].price;
-        // 1 บาททองคำ = 15.244 กรัม, ความบริสุทธิ์ไทย 96.5%, 1 ทรอยออนซ์ = 31.1035 กรัม
-        if (usd > 0 && thb > 0) setSpotCalc({ usd, thb, baht: (usd * thb * 15.244 / 31.1035) * 0.965 });
-      } catch (e) { /* ใช้ค่ารอบก่อน */ }
+    let cancelled = false;
+
+    const toNumber = (value) => {
+      if (value === null || value === undefined || value === "") return null;
+      const n = Number(String(value).replace(/,/g, "").replace(/[^0-9.-]/g, ""));
+      return Number.isFinite(n) ? n : null;
     };
+
+    const readJson = async (response, sourceName) => {
+      const raw = await response.text();
+      let data;
+
+      try {
+        data = JSON.parse(raw);
+      } catch (error) {
+        throw new Error(`${sourceName} ตอบกลับไม่ใช่ข้อมูล JSON (HTTP ${response.status})`);
+      }
+
+      if (!response.ok) {
+        throw new Error(data?.error || data?.message || `${sourceName} ตอบกลับ HTTP ${response.status}`);
+      }
+
+      return data;
+    };
+
+    const normaliseThaiGold = (data) => {
+      // รองรับผลลัพธ์จาก /api/thaigold เดิมของระบบ
+      if (data && (data.barBuy || data.barSell || data.ornBuy || data.ornSell)) {
+        const result = {
+          barBuy: toNumber(data.barBuy),
+          barSell: toNumber(data.barSell),
+          ornBuy: toNumber(data.ornBuy),
+          ornSell: toNumber(data.ornSell),
+          source: data.source || "ข้อมูลราคาทองคำไทย",
+          updateDate: data.updateDate || data.update_date || "",
+          updateTime: data.updateTime || data.update_time || "",
+        };
+
+        if (result.barBuy > 0 && result.barSell > 0 && result.ornBuy > 0 && result.ornSell > 0) {
+          return result;
+        }
+      }
+
+      // รองรับ Thai Gold API: { status, response: { price: { gold, gold_bar } } }
+      const responseData = data?.response;
+      const price = responseData?.price;
+
+      if (data?.status === "success" && price) {
+        const result = {
+          barBuy: toNumber(price?.gold_bar?.buy),
+          barSell: toNumber(price?.gold_bar?.sell),
+          ornBuy: toNumber(price?.gold?.buy),
+          ornSell: toNumber(price?.gold?.sell),
+          source: "สมาคมค้าทองคำ ผ่าน Thai Gold API",
+          updateDate: responseData?.update_date || "",
+          updateTime: responseData?.update_time || "",
+        };
+
+        if (result.barBuy > 0 && result.barSell > 0 && result.ornBuy > 0 && result.ornSell > 0) {
+          return result;
+        }
+      }
+
+      throw new Error("รูปแบบข้อมูลราคาทองไม่ถูกต้องหรือข้อมูลไม่ครบถ้วน");
+    };
+
+    const loadThaiGold = async () => {
+      // ลอง API ภายในเว็บก่อน แล้วจึงลอง API สาธารณะโดยตรง
+      const urls = [
+        "/api/thaigold",
+        "https://api.chnwt.dev/thai-gold-api/latest",
+      ];
+
+      const errors = [];
+
+      for (const url of urls) {
+        try {
+          const response = await fetch(url, {
+            method: "GET",
+            headers: { Accept: "application/json" },
+            cache: "no-store",
+          });
+
+          const rawData = await readJson(response, url);
+          const goldData = normaliseThaiGold(rawData);
+
+          if (!cancelled) {
+            setThaiGold(goldData);
+            setGoldErr("");
+          }
+          return;
+        } catch (error) {
+          errors.push(error?.message || String(error));
+        }
+      }
+
+      if (!cancelled) {
+        setThaiGold(null);
+        setGoldErr("ขณะนี้ดึงราคาประกาศของสมาคมค้าทองคำไม่ได้ ระบบจะแสดงราคาคำนวณจากตลาดโลกแทน");
+      }
+    };
+
+    const loadSpotGold = async () => {
+      try {
+        // ดึง Gold Futures และ USD/THB แยกต่างหาก
+        const response = await fetch(
+          "/api/fx?symbols=" + encodeURIComponent("GC=F,THB=X"),
+          {
+            method: "GET",
+            headers: { Accept: "application/json" },
+            cache: "no-store",
+          }
+        );
+
+        const q = await readJson(response, "API ราคาตลาดโลก");
+        const usd = Number(q?.["GC=F"]?.price);
+        const thb = Number(q?.["THB=X"]?.price);
+
+        // 1 บาททองคำ = 15.244 กรัม, ทองไทย 96.5%, 1 ทรอยออนซ์ = 31.1035 กรัม
+        if (usd > 0 && thb > 0 && !cancelled) {
+          setSpotCalc({
+            usd,
+            thb,
+            baht: usd * thb * (15.244 / 31.1035) * 0.965,
+          });
+        }
+      } catch (error) {
+        // เก็บค่ารอบก่อนเอาไว้ ไม่ทำให้หน้าเว็บพัง
+        console.error("โหลดราคาทองจากตลาดโลกไม่สำเร็จ:", error);
+      }
+    };
+
+    const loadGold = async () => {
+      await Promise.allSettled([loadThaiGold(), loadSpotGold()]);
+    };
+
     loadGold();
     const id = setInterval(loadGold, 300000); // ทุก 5 นาที
-    return () => clearInterval(id);
+
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
   }, []);
 
   /* ---------- รายการสินทรัพย์ที่ติดตาม: เพิ่ม/ลบเองได้ บันทึกถาวรในเครื่อง ---------- */
@@ -244,43 +367,66 @@ export default function ForexTab() {
       <div style={{ ...card, padding: 16, borderLeft: "4px solid #DDBB55" }}>
         <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
           <div style={{ fontWeight: 700, color: ink }}>🪙 ราคาทองคำไทย (บาท / บาททองคำ)</div>
-          <span style={{ fontSize: 11, color: sub }}>{thaiGold && thaiGold.source ? `แหล่งข้อมูล: ${thaiGold.source} · อัปเดตทุก ~5 นาที` : ""}</span>
+          <span style={{ fontSize: 11, color: sub }}>
+            {thaiGold?.source
+              ? `แหล่งข้อมูล: ${thaiGold.source}${thaiGold.updateDate || thaiGold.updateTime ? ` · ${thaiGold.updateDate || ""} ${thaiGold.updateTime || ""}` : ""}`
+              : "อัปเดตอัตโนมัติทุกประมาณ 5 นาที"}
+          </span>
         </div>
-        {goldErr && <p style={{ fontSize: 12.5, color: "#B03A3A", margin: "6px 0 0" }}>{goldErr}</p>}
-        {thaiGold && (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(210px,1fr))", gap: 8, marginTop: 10 }}>
-            <div style={{ padding: "10px 12px", borderRadius: 10, background: "#FBF7EA", border: "1px solid #EBDFB8" }}>
-              <div style={{ fontSize: 12, fontWeight: 700, color: "#96762A" }}>ทองคำแท่ง 96.5% (ราคาสมาคมฯ)</div>
-              <div style={{ fontSize: 13.5, marginTop: 4, ...num }}>
-                รับซื้อ <b>{thaiGold.barBuy ? fmt(thaiGold.barBuy, 0) : "—"}</b> · ขายออก <b style={{ color: "#B4638A" }}>{thaiGold.barSell ? fmt(thaiGold.barSell, 0) : "—"}</b>
-              </div>
-            </div>
-            <div style={{ padding: "10px 12px", borderRadius: 10, background: "#FBF7EA", border: "1px solid #EBDFB8" }}>
-              <div style={{ fontSize: 12, fontWeight: 700, color: "#96762A" }}>ทองรูปพรรณ (ราคาสมาคมฯ)</div>
-              <div style={{ fontSize: 13.5, marginTop: 4, ...num }}>
-                รับซื้อ <b>{thaiGold.ornBuy ? fmt(thaiGold.ornBuy, 0) : "—"}</b> · ขายออก <b style={{ color: "#B4638A" }}>{thaiGold.ornSell ? fmt(thaiGold.ornSell, 0) : "—"}</b>
-              </div>
-            </div>
-            <div style={{ padding: "10px 12px", borderRadius: 10, background: "#F0F5FB", border: "1px solid #C9D6EA" }}>
-              <div style={{ fontSize: 12, fontWeight: 700, color: blue }}>คำนวณจากตลาดโลก (โดยประมาณ)</div>
-              <div style={{ fontSize: 13.5, marginTop: 4, ...num }}>
-                {spotCalc ? (
-                  <>
-                    ≈ <b>{fmt(spotCalc.baht, 0)}</b> บาท/บาททอง
-                    <div style={{ fontSize: 11.5, color: sub, marginTop: 2 }}>
-                      Gold ${fmt(spotCalc.usd, 1)}/oz × {fmt(spotCalc.thb, 2)} ฿/$ × 0.4729
-                      {thaiGold.barSell > 0 && <> · ต่างจากราคาขายสมาคม {thaiGold.barSell >= spotCalc.baht ? "+" : "−"}{fmt(Math.abs(thaiGold.barSell - spotCalc.baht), 0)} บ.</>}
-                    </div>
-                  </>
-                ) : "…"}
-              </div>
-            </div>
+
+        {goldErr && (
+          <div style={{ marginTop: 8, padding: "8px 10px", borderRadius: 8, background: "#FFF7E6", border: "1px solid #F0D7A1" }}>
+            <div style={{ fontSize: 12.5, color: "#96762A", fontWeight: 600 }}>{goldErr}</div>
           </div>
         )}
-        {!thaiGold && !goldErr && <p style={{ fontSize: 12.5, color: sub, margin: "8px 0 0" }}>กำลังโหลดราคาสมาคมค้าทองคำ…</p>}
+
+        {(thaiGold || spotCalc) && (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(210px,1fr))", gap: 8, marginTop: 10 }}>
+            {thaiGold && (
+              <>
+                <div style={{ padding: "10px 12px", borderRadius: 10, background: "#FBF7EA", border: "1px solid #EBDFB8" }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: "#96762A" }}>ทองคำแท่ง 96.5% (ราคาสมาคมฯ)</div>
+                  <div style={{ fontSize: 13.5, marginTop: 4, ...num }}>
+                    รับซื้อ <b>{thaiGold.barBuy ? fmt(thaiGold.barBuy, 0) : "—"}</b> · ขายออก <b style={{ color: "#B4638A" }}>{thaiGold.barSell ? fmt(thaiGold.barSell, 0) : "—"}</b>
+                  </div>
+                </div>
+
+                <div style={{ padding: "10px 12px", borderRadius: 10, background: "#FBF7EA", border: "1px solid #EBDFB8" }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: "#96762A" }}>ทองรูปพรรณ 96.5% (ราคาสมาคมฯ)</div>
+                  <div style={{ fontSize: 13.5, marginTop: 4, ...num }}>
+                    รับซื้อ <b>{thaiGold.ornBuy ? fmt(thaiGold.ornBuy, 0) : "—"}</b> · ขายออก <b style={{ color: "#B4638A" }}>{thaiGold.ornSell ? fmt(thaiGold.ornSell, 0) : "—"}</b>
+                  </div>
+                </div>
+              </>
+            )}
+
+            {spotCalc && (
+              <div style={{ padding: "10px 12px", borderRadius: 10, background: "#F0F5FB", border: "1px solid #C9D6EA" }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: blue }}>คำนวณจากตลาดโลก (โดยประมาณ)</div>
+                <div style={{ fontSize: 13.5, marginTop: 4, ...num }}>
+                  ≈ <b>{fmt(spotCalc.baht, 0)}</b> บาท/บาททอง
+                  <div style={{ fontSize: 11.5, color: sub, marginTop: 2 }}>
+                    Gold ${fmt(spotCalc.usd, 1)}/oz × {fmt(spotCalc.thb, 2)} ฿/$ × 0.47295
+                    {thaiGold?.barSell > 0 && (
+                      <>
+                        {" · "}ต่างจากราคาขายสมาคม {thaiGold.barSell >= spotCalc.baht ? "+" : "−"}
+                        {fmt(Math.abs(thaiGold.barSell - spotCalc.baht), 0)} บาท
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {!thaiGold && !spotCalc && !goldErr && (
+          <p style={{ fontSize: 12.5, color: sub, margin: "8px 0 0" }}>กำลังโหลดราคาทองคำ…</p>
+        )}
+
         <p style={{ fontSize: 11.5, color: sub, margin: "8px 0 0", lineHeight: 1.7 }}>
-          สูตรแปลง: 1 บาททองคำ = 15.244 กรัม ความบริสุทธิ์ไทย 96.5% (ตัวคูณ ≈ 0.4729 ต่อออนซ์)
-          ราคาสมาคมฯ มักสูง/ต่ำกว่าค่าคำนวณเล็กน้อยจากค่าพรีเมียมนำเข้า การปัดเศษครั้งละ 50 บาท และรอบเวลาประกาศระหว่างวัน
+          สูตรแปลง: 1 บาททองคำ = 15.244 กรัม ความบริสุทธิ์ไทย 96.5% ตัวคูณประมาณ 0.47295 ต่อทรอยออนซ์
+          ราคาคำนวณจากตลาดโลกเป็นค่าประมาณและอาจแตกต่างจากราคาประกาศของสมาคมค้าทองคำ
         </p>
       </div>
 
