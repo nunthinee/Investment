@@ -9,7 +9,7 @@ import React, { useState, useEffect, useCallback } from "react";
    - ข่าวเศรษฐกิจสัปดาห์นี้จากฟีด ForexFactory
    ===================================================================== */
 
-const FX_LIST = [
+const DEFAULT_FX = [
   { sym: "THB=X", label: "USD/THB", desc: "ดอลลาร์–บาท", d: 2 },
   { sym: "EURUSD=X", label: "EUR/USD", desc: "ยูโร–ดอลลาร์", d: 4 },
   { sym: "GBPUSD=X", label: "GBP/USD", desc: "ปอนด์–ดอลลาร์", d: 4 },
@@ -74,6 +74,51 @@ export default function ForexTab() {
   const [now, setNow] = useState(bkkNow());
   const [impactFilter, setImpactFilter] = useState("High");
 
+  /* ---------- ราคาทองคำไทย (สมาคมฯ + คำนวณจาก Spot โลก) ---------- */
+  const [thaiGold, setThaiGold] = useState(null);
+  const [spotCalc, setSpotCalc] = useState(null);
+  const [goldErr, setGoldErr] = useState("");
+
+  useEffect(() => {
+    const loadGold = async () => {
+      try {
+        const r = await fetch("/api/thaigold");
+        const d = await r.json();
+        if (d.error) throw new Error(d.error);
+        setThaiGold(d); setGoldErr("");
+      } catch (e) { setGoldErr("ดึงราคาสมาคมค้าทองคำไม่สำเร็จ: " + (e.message || e)); }
+      try {
+        // ดึง Spot ทอง + USD/THB แยกต่างหาก (ทำงานแม้ผู้ใช้ลบ 2 ตัวนี้ออกจากรายการติดตาม)
+        const r2 = await fetch("/api/fx?symbols=" + encodeURIComponent("GC=F,THB=X"));
+        const q = await r2.json();
+        const usd = q["GC=F"] && q["GC=F"].price;
+        const thb = q["THB=X"] && q["THB=X"].price;
+        // 1 บาททองคำ = 15.244 กรัม, ความบริสุทธิ์ไทย 96.5%, 1 ทรอยออนซ์ = 31.1035 กรัม
+        if (usd > 0 && thb > 0) setSpotCalc({ usd, thb, baht: (usd * thb * 15.244 / 31.1035) * 0.965 });
+      } catch (e) { /* ใช้ค่ารอบก่อน */ }
+    };
+    loadGold();
+    const id = setInterval(loadGold, 300000); // ทุก 5 นาที
+    return () => clearInterval(id);
+  }, []);
+
+  /* ---------- รายการสินทรัพย์ที่ติดตาม: เพิ่ม/ลบเองได้ บันทึกถาวรในเครื่อง ---------- */
+  const [fxList, setFxList] = useState(() => {
+    try {
+      const v = JSON.parse(localStorage.getItem("fxList") || "null");
+      return Array.isArray(v) && v.length ? v : DEFAULT_FX;
+    } catch (e) { return DEFAULT_FX; }
+  });
+  const [addForm, setAddForm] = useState({ sym: "", label: "" });
+  const saveFx = (list) => { setFxList(list); try { localStorage.setItem("fxList", JSON.stringify(list)); } catch (e) {} };
+  const addSymbol = () => {
+    const sym = addForm.sym.trim().toUpperCase();
+    if (!sym || fxList.some((f) => f.sym === sym)) return;
+    saveFx([...fxList, { sym, label: addForm.label.trim() || sym, desc: "เพิ่มเอง", d: 4 }]);
+    setAddForm({ sym: "", label: "" });
+  };
+  const removeSymbol = (sym) => { if (fxList.length > 1) saveFx(fxList.filter((f) => f.sym !== sym)); };
+
   const ink = "#3A4358", sub = "#7C86A0", blue = "#3D6FB4";
   const card = { background: "#fff", border: "1px solid #E4E9F2", borderRadius: 14, boxShadow: "0 1px 3px rgba(90,110,160,.06)" };
   const num = { fontVariantNumeric: "tabular-nums" };
@@ -81,7 +126,7 @@ export default function ForexTab() {
   /* ดึงราคา + เช็กเงื่อนไขเตือน ทุก 60 วินาที */
   const refresh = useCallback(async () => {
     try {
-      const r = await fetch("/api/fx?symbols=" + encodeURIComponent(FX_LIST.map((f) => f.sym).join(",")));
+      const r = await fetch("/api/fx?symbols=" + encodeURIComponent(fxList.map((f) => f.sym).join(",")));
       const q = await r.json();
       setQuotes(q);
       setAlerts((prev) => {
@@ -93,7 +138,7 @@ export default function ForexTab() {
         });
         if (fired.length) {
           fired.forEach((a) => {
-            const lbl = FX_LIST.find((f) => f.sym === a.sym)?.label || a.sym;
+            const lbl = fxList.find((f) => f.sym === a.sym)?.label || a.sym;
             const msg = `${lbl} ${a.dir === "above" ? "ขึ้นถึง" : "ลงถึง"} ${a.price} (ราคาตอนนี้ ${fmt(a.cur, 4)})`;
             if (typeof Notification !== "undefined" && Notification.permission === "granted") {
               new Notification("🔔 แจ้งเตือนราคา", { body: msg });
@@ -106,7 +151,7 @@ export default function ForexTab() {
         return remain;
       });
     } catch (e) { /* รอบถัดไปลองใหม่ */ }
-  }, []);
+  }, [fxList]);
 
   useEffect(() => {
     refresh();
@@ -168,7 +213,7 @@ export default function ForexTab() {
 
       {/* ราคาสด + แนวโน้ม */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(210px,1fr))", gap: 10 }}>
-        {FX_LIST.map((f) => {
+        {fxList.map((f) => {
           const q = quotes[f.sym];
           const tr = trendOf(q);
           const up = q && q.chg1d >= 0;
@@ -176,7 +221,11 @@ export default function ForexTab() {
             <div key={f.sym} style={{ ...card, padding: 14 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <div style={{ fontWeight: 700, color: blue }}>{f.label}</div>
-                <span style={{ fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 999, background: tr.bg, color: tr.c }}>{tr.t}</span>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span style={{ fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 999, background: tr.bg, color: tr.c }}>{tr.t}</span>
+                  <span onClick={() => removeSymbol(f.sym)} title="ลบออกจากรายการ"
+                    style={{ cursor: "pointer", color: "#C9D2DE", fontWeight: 700, fontSize: 13, padding: "0 2px" }}>✕</span>
+                </div>
               </div>
               <div style={{ fontSize: 11.5, color: sub }}>{f.desc}</div>
               <div style={{ fontSize: 22, fontWeight: 700, marginTop: 6, color: ink, ...num }}>{q ? fmt(q.price, f.d) : "…"}</div>
@@ -191,6 +240,68 @@ export default function ForexTab() {
         })}
       </div>
 
+      {/* ราคาทองคำไทย */}
+      <div style={{ ...card, padding: 16, borderLeft: "4px solid #DDBB55" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+          <div style={{ fontWeight: 700, color: ink }}>🪙 ราคาทองคำไทย (บาท / บาททองคำ)</div>
+          <span style={{ fontSize: 11, color: sub }}>{thaiGold && thaiGold.source ? `แหล่งข้อมูล: ${thaiGold.source} · อัปเดตทุก ~5 นาที` : ""}</span>
+        </div>
+        {goldErr && <p style={{ fontSize: 12.5, color: "#B03A3A", margin: "6px 0 0" }}>{goldErr}</p>}
+        {thaiGold && (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(210px,1fr))", gap: 8, marginTop: 10 }}>
+            <div style={{ padding: "10px 12px", borderRadius: 10, background: "#FBF7EA", border: "1px solid #EBDFB8" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "#96762A" }}>ทองคำแท่ง 96.5% (ราคาสมาคมฯ)</div>
+              <div style={{ fontSize: 13.5, marginTop: 4, ...num }}>
+                รับซื้อ <b>{thaiGold.barBuy ? fmt(thaiGold.barBuy, 0) : "—"}</b> · ขายออก <b style={{ color: "#B4638A" }}>{thaiGold.barSell ? fmt(thaiGold.barSell, 0) : "—"}</b>
+              </div>
+            </div>
+            <div style={{ padding: "10px 12px", borderRadius: 10, background: "#FBF7EA", border: "1px solid #EBDFB8" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "#96762A" }}>ทองรูปพรรณ (ราคาสมาคมฯ)</div>
+              <div style={{ fontSize: 13.5, marginTop: 4, ...num }}>
+                รับซื้อ <b>{thaiGold.ornBuy ? fmt(thaiGold.ornBuy, 0) : "—"}</b> · ขายออก <b style={{ color: "#B4638A" }}>{thaiGold.ornSell ? fmt(thaiGold.ornSell, 0) : "—"}</b>
+              </div>
+            </div>
+            <div style={{ padding: "10px 12px", borderRadius: 10, background: "#F0F5FB", border: "1px solid #C9D6EA" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: blue }}>คำนวณจากตลาดโลก (โดยประมาณ)</div>
+              <div style={{ fontSize: 13.5, marginTop: 4, ...num }}>
+                {spotCalc ? (
+                  <>
+                    ≈ <b>{fmt(spotCalc.baht, 0)}</b> บาท/บาททอง
+                    <div style={{ fontSize: 11.5, color: sub, marginTop: 2 }}>
+                      Gold ${fmt(spotCalc.usd, 1)}/oz × {fmt(spotCalc.thb, 2)} ฿/$ × 0.4729
+                      {thaiGold.barSell > 0 && <> · ต่างจากราคาขายสมาคม {thaiGold.barSell >= spotCalc.baht ? "+" : "−"}{fmt(Math.abs(thaiGold.barSell - spotCalc.baht), 0)} บ.</>}
+                    </div>
+                  </>
+                ) : "…"}
+              </div>
+            </div>
+          </div>
+        )}
+        {!thaiGold && !goldErr && <p style={{ fontSize: 12.5, color: sub, margin: "8px 0 0" }}>กำลังโหลดราคาสมาคมค้าทองคำ…</p>}
+        <p style={{ fontSize: 11.5, color: sub, margin: "8px 0 0", lineHeight: 1.7 }}>
+          สูตรแปลง: 1 บาททองคำ = 15.244 กรัม ความบริสุทธิ์ไทย 96.5% (ตัวคูณ ≈ 0.4729 ต่อออนซ์)
+          ราคาสมาคมฯ มักสูง/ต่ำกว่าค่าคำนวณเล็กน้อยจากค่าพรีเมียมนำเข้า การปัดเศษครั้งละ 50 บาท และรอบเวลาประกาศระหว่างวัน
+        </p>
+      </div>
+
+      {/* เพิ่ม/ลบสินทรัพย์ที่ติดตาม */}
+      <div style={{ ...card, padding: 16 }}>
+        <div style={{ fontWeight: 700, color: ink }}>⚙️ เพิ่มสินทรัพย์ที่ติดตาม</div>
+        <p style={{ fontSize: 12, color: sub, margin: "4px 0 10px", lineHeight: 1.7 }}>
+          ใส่สัญลักษณ์รูปแบบ Yahoo Finance: คู่เงิน <b>EURUSD=X</b>, <b>GBPJPY=X</b> · ดอลลาร์–บาท <b>THB=X</b> · ทอง <b>GC=F</b> · เงิน <b>SI=F</b> · น้ำมัน <b>CL=F</b> · บิตคอยน์ <b>BTC-USD</b> · หุ้นสหรัฐฯ <b>NVDA</b> · หุ้นไทย <b>PTT.BK</b> — ลบตัวที่ไม่เทรดด้วย ✕ มุมการ์ดราคา รายการบันทึกถาวรในเครื่องนี้
+        </p>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <input placeholder="สัญลักษณ์ เช่น EURUSD=X" value={addForm.sym}
+            onChange={(e) => setAddForm({ ...addForm, sym: e.target.value })}
+            style={{ padding: "8px 10px", border: "1px solid #D5DDEA", borderRadius: 10, fontSize: 13, width: 180, fontFamily: "inherit" }} />
+          <input placeholder="ชื่อที่แสดง (ไม่บังคับ)" value={addForm.label}
+            onChange={(e) => setAddForm({ ...addForm, label: e.target.value })}
+            style={{ padding: "8px 10px", border: "1px solid #D5DDEA", borderRadius: 10, fontSize: 13, width: 160, fontFamily: "inherit" }} />
+          <button onClick={addSymbol} style={{ padding: "8px 18px", borderRadius: 999, border: "none", fontWeight: 700, fontSize: 13, background: "linear-gradient(90deg,#8FB6E8,#F0A8C6)", color: "#fff" }}>+ เพิ่ม</button>
+        </div>
+        <p style={{ fontSize: 11.5, color: sub, margin: "8px 0 0" }}>ถ้าเพิ่มแล้วราคาขึ้น "…" ค้าง แปลว่าสัญลักษณ์ไม่ถูกต้อง — ลบทิ้งแล้วตรวจชื่อจาก finance.yahoo.com</p>
+      </div>
+
       {/* ตั้งเตือนราคา */}
       <div style={{ ...card, padding: 16 }}>
         <div style={{ fontWeight: 700, color: ink }}>🔔 ตั้งเตือนราคา</div>
@@ -201,7 +312,7 @@ export default function ForexTab() {
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <select value={form.sym} onChange={(e) => setForm({ ...form, sym: e.target.value })}
             style={{ padding: "8px 10px", border: "1px solid #D5DDEA", borderRadius: 10, fontSize: 13, fontFamily: "inherit" }}>
-            {FX_LIST.map((f) => <option key={f.sym} value={f.sym}>{f.label}</option>)}
+            {fxList.map((f) => <option key={f.sym} value={f.sym}>{f.label}</option>)}
           </select>
           <select value={form.dir} onChange={(e) => setForm({ ...form, dir: e.target.value })}
             style={{ padding: "8px 10px", border: "1px solid #D5DDEA", borderRadius: 10, fontSize: 13, fontFamily: "inherit" }}>
@@ -216,7 +327,7 @@ export default function ForexTab() {
         {alerts.length > 0 && (
           <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
             {alerts.map((a, i) => {
-              const f = FX_LIST.find((x) => x.sym === a.sym);
+              const f = fxList.find((x) => x.sym === a.sym);
               return (
                 <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 12px", background: "#F4F7FB", borderRadius: 10, fontSize: 13 }}>
                   <span style={num}><b style={{ color: blue }}>{f?.label}</b> {a.dir === "above" ? "ขึ้นถึง ≥" : "ลงถึง ≤"} <b>{a.price}</b></span>
